@@ -1,0 +1,62 @@
+# Build artifacts
+build/
+out/
+*.bin
+*.uf2
+*.hex
+*.bin
+*.part
+*.dat
+
+# Compiler-generated files
+*.d
+*.o
+*.cpp.o
+*.c.o
+*.d
+*.log
+*.map
+*.sym
+
+# IDE-specific files
+platformio.ini
+platformio/  # PlatformIO generated files
+*.pid
+*.pid.lock
+*.pid
+*.platformio
+*.platformio.ini
+
+# ESP32-specific
+esp-idf/
+esp-idf/
+lib/
+lib/esp-idf/
+esp-idf/esp-id
+*.bin
+*.bin
+*.bin
+*.bin
+
+# Temporary files
+*.tmp
+*.tmp.*
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# IDE and editor
+.vscode/
+*.sln
+*.suo
+*.user
+*.userprefs
+*.swp
+*.swo
+*.swn
+
+# PlatformIO generated files (if used)
+.platformio/
+project-conf.json
+platformio.ini
