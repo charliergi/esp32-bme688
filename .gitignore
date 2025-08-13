@@ -60,3 +60,5 @@ Thumbs.db
 .platformio/
 project-conf.json
 platformio.ini
+
+.devcontainer
