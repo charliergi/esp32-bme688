@@ -1,4 +1,4 @@
-idf_component_register(SRCS "hello_world_main.c"
+idf_component_register(SRCS "main.c"
                        PRIV_REQUIRES spi_flash driver Bosch-BME68x-Library nvs_flash esp_netif esp_event esp_wifi mqtt
                        INCLUDE_DIRS "."
                        EMBED_TXTFILES ".env")
