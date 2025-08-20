@@ -23,6 +23,6 @@ int8_t bme68x_spi_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *
 int8_t bme68x_spi_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr);
 void bme68x_delay_us(uint32_t period, void *intf_ptr);
 unsigned long get_millis();
-void newDataCallback(const bme68x_data data, const bsecOutputs outputs, Bsec2 bsec);
+// void newDataCallback(const bme68x_data data, const bsecOutputs outputs, Bsec2 bsec);
 void checkBsecStatus(Bsec2 bsec);
 void errLeds();

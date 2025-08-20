@@ -1,257 +1,314 @@
-/*
- * This example code is in the Public Domain (or CC0 licensed, at your option.)
- * Unless required by applicable law or agreed to in writing, this software is distributed
- * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/**
+ * @file main.cpp
+ * @brief ESP-IDF adaptation of the basic.ino BSEC2 example.
  *
- * This code demonstrates how to interface with a Bosch BME688 sensor over the SPI bus
- * on an ESP32-S3 using the ESP-IDF framework and the Bosch BME68x-Library.
+ * This file is designed to be the main entry point for an ESP-IDF project.
+ * It replaces Arduino-specific functions with their ESP-IDF equivalents for
+ * logging, GPIO control, and SPI communication.
+ *
+ * Copyright (C) 2021 Bosch Sensortec GmbH
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Modifications for ESP-IDF Copyright (C) 2025
  */
+
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
-
+#include "esp_log.h"
 #include "rom/ets_sys.h" // For ets_delay_us
+#include "esp_timer.h"   // For esp_timer_get_time
 
-#include "nvs_flash.h"
-#include "esp_netif.h"
-#include "esp_event.h"
-#include "mqtt_client.h"
-// #include "bsec2_control/bsec2_control.h"
-#include "bme688_control/bme688_control.h"
-#include "mqtt/mqtt.h"  // Include mqtt.h which provides access to mqtt_client
-#include "bsec2_control/bsec2_control.h"
+// Include the BSEC2 library header
+#include "bsec2.h"
+
+// --- Configuration ---
+static const char* TAG = "BSEC_EXAMPLE";
+
+// GPIO settings for ESP32-S3 (please verify for your specific board)
+#define PANIC_LED   GPIO_NUM_2      // Example: Built-in LED on many ESP32-S3 boards
+#define PIN_SCK     GPIO_NUM_12
+#define PIN_MISO    GPIO_NUM_13
+#define PIN_MOSI    GPIO_NUM_11
+#define PIN_CS      GPIO_NUM_10
+
+// SPI Host
+#define BME_SPI_HOST SPI2_HOST
+
+// BSEC constants from original .ino
+#define ERROR_DUR   1000
+#define SAMPLE_RATE BSEC_SAMPLE_RATE_LP
+
+// --- Global Objects and Variables ---
+Bsec2 envSensor; // Create an object of the class Bsec2
+spi_device_handle_t spi_handle; // Handle for the SPI device
+
+// --- Helper function declarations ---
+void errLeds(void);
+void checkBsecStatus(Bsec2 bsec);
+void newDataCallback(const bme68x_data data, const bsecOutputs outputs, Bsec2 bsec);
+
+// --- ESP-IDF specific BME68x interface functions ---
+
+/**
+ * @brief SPI write function for ESP-IDF
+ */
+int8_t bme_spi_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr) {
+    spi_device_handle_t handle = *(spi_device_handle_t *)intf_ptr;
+    esp_err_t ret;
+
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.flags = SPI_TRANS_USE_TXDATA; // Use tx_data for single-byte address
+    t.tx_data[0] = reg_addr & 0x7F; // Write operation: MSB is 0
+    t.length = 8; // 8 bits for the register address
+
+    // Transmit the register address
+    ret = spi_device_polling_transmit(handle, &t);
+    if (ret != ESP_OK) return -1;
+
+    // Transmit the data
+    if (len > 0) {
+        memset(&t, 0, sizeof(t));
+        t.tx_buffer = reg_data;
+        t.length = len * 8; // length is in bits
+        ret = spi_device_polling_transmit(handle, &t);
+        if (ret != ESP_OK) return -1;
+    }
+    
+    return 0;
+}
+
+/**
+ * @brief SPI read function for ESP-IDF
+ */
+int8_t bme_spi_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr) {
+    spi_device_handle_t handle = *(spi_device_handle_t *)intf_ptr;
+    esp_err_t ret;
+
+    if (len == 0) {
+        return 0;
+    }
+
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = len * 8; // Total bits to receive
+    t.rxlength = len * 8;
+    t.tx_buffer = NULL;
+    t.rx_buffer = reg_data;
+    t.cmd = reg_addr | 0x80; // Command phase: register address with read bit
+
+    ret = spi_device_polling_transmit(handle, &t);
+
+    return (ret == ESP_OK) ? 0 : -1;
+}
+
+/**
+ * @brief Delay function wrapper for BSEC library
+ */
+void bme_delay_us(uint32_t period, void *intf_ptr) {
+    ets_delay_us(period);
+}
+
+/**
+ * @brief Milliseconds getter function for BSEC library
+ */
+unsigned long bme_millis() {
+    return (unsigned long) (esp_timer_get_time() / 1000);
+}
 
 
-// Global handle for the SPI device
-static spi_device_handle_t spi_handle;
+// --- Main Application Entry Point ---
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting BSEC2 Example for ESP-IDF");
 
-// Struct to hold sensor data
-static struct bme68x_dev bme68x_sensor;
-
-Bsec2 envSensor;
-spi_device_handle_t spi;
-
-
-
-
-// MQTT client is now imported from mqtt.cpp via the mqtt.h header
-
-void setup_bsec2(void){
-    // setup bsec2
-    // Init LED
+    // --- GPIO & SPI Bus Initialization ---
+    
+    // Configure Panic LED
+    gpio_reset_pin(PANIC_LED);
     gpio_set_direction(PANIC_LED, GPIO_MODE_OUTPUT);
 
-    // Init SPI bus
-    spi_bus_config_t buscfg = {
-        .mosi_io_num = GPIO_NUM_11,
-        .miso_io_num = GPIO_NUM_13,
-        .sclk_io_num = GPIO_NUM_12,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .data4_io_num = -1,
-        .data5_io_num = -1,
-        .data6_io_num = -1,
-        .data7_io_num = -1,
-        .data_io_default_level = 0,
-        .max_transfer_sz = 0,
-        .flags = 0,
-        .isr_cpu_id = ESP_INTR_CPU_AFFINITY_AUTO,
-        .intr_flags = 0,
-    };
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    // Configure SPI bus
+    spi_bus_config_t buscfg = {}; // Zero-initialize
+    buscfg.mosi_io_num = PIN_MOSI;
+    buscfg.miso_io_num = PIN_MISO;
+    buscfg.sclk_io_num = PIN_SCK;
+    buscfg.quadwp_io_num = -1;
+    buscfg.quadhd_io_num = -1;
+    buscfg.max_transfer_sz = 32;
 
-    spi_device_interface_config_t devcfg = {};  // Zero-initialize all fields
-    devcfg.clock_speed_hz = 1 * 1000 * 1000;
-    devcfg.spics_io_num = PIN_CS;
-    devcfg.queue_size = 1;
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &spi));
+    esp_err_t ret = spi_bus_initialize(BME_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    ESP_ERROR_CHECK(ret);
 
-    // Init BSEC2
-    if (!envSensor.begin(BME68X_SPI_INTF, bme68x_spi_read, bme68x_spi_write, bme68x_delay_us, &spi, get_millis)) {
+    // Configure SPI device
+    spi_device_interface_config_t devcfg = {}; // Zero-initialize
+    devcfg.mode = 0; // SPI mode 0
+    devcfg.clock_speed_hz = 10 * 1000 * 1000; // 10 MHz
+    devcfg.spics_io_num = PIN_CS; // Chip select pin 
+    devcfg.queue_size = 7;
+    
+    ret = spi_bus_add_device(BME_SPI_HOST, &devcfg, &spi_handle);
+    ESP_ERROR_CHECK(ret);
+
+    // --- BSEC Library Initialization ---
+    // Initialize the library using the generic interface with function pointers
+    if (!envSensor.begin(BME68X_SPI_INTF, bme_spi_read, bme_spi_write, bme_delay_us, &spi_handle, bme_millis)) {
+        ESP_LOGE(TAG, "Failed to initialize BSEC library.");
         checkBsecStatus(envSensor);
     }
 
-    if (SAMPLE_RATE == BSEC_SAMPLE_RATE_ULP) {
-        envSensor.setTemperatureOffset(2.0f);
-    } else if (SAMPLE_RATE == BSEC_SAMPLE_RATE_LP) {
-        envSensor.setTemperatureOffset(1.0f);
-    }
 
+    // Set temperature offset based on sample rate 
+	if (SAMPLE_RATE == BSEC_SAMPLE_RATE_ULP)
+	{
+		envSensor.setTemperatureOffset(TEMP_OFFSET_ULP);
+	}
+	else if (SAMPLE_RATE == BSEC_SAMPLE_RATE_LP)
+	{
+		envSensor.setTemperatureOffset(TEMP_OFFSET_LP);
+	}
+
+    // Define the list of sensors to subscribe to
     bsecSensor sensorList[] = {
         BSEC_OUTPUT_IAQ,
         BSEC_OUTPUT_RAW_TEMPERATURE,
         BSEC_OUTPUT_RAW_PRESSURE,
         BSEC_OUTPUT_RAW_HUMIDITY,
         BSEC_OUTPUT_RAW_GAS,
+        BSEC_OUTPUT_STABILIZATION_STATUS,
+        BSEC_OUTPUT_RUN_IN_STATUS,
+        BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE,
+        BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,
         BSEC_OUTPUT_STATIC_IAQ,
         BSEC_OUTPUT_CO2_EQUIVALENT,
         BSEC_OUTPUT_BREATH_VOC_EQUIVALENT,
+        BSEC_OUTPUT_GAS_PERCENTAGE,
+        BSEC_OUTPUT_COMPENSATED_GAS
     };
 
-    if (!envSensor.updateSubscription(sensorList, sizeof(sensorList)/sizeof(sensorList[0]), SAMPLE_RATE)) {
+    // Update the subscription
+    if (!envSensor.updateSubscription(sensorList, ARRAY_LEN(sensorList), SAMPLE_RATE)) {
+        ESP_LOGE(TAG, "Failed to update subscription.");
         checkBsecStatus(envSensor);
     }
 
+    // Attach the callback function for new data
     envSensor.attachCallback(newDataCallback);
 
     ESP_LOGI(TAG, "BSEC library version %d.%d.%d.%d",
-             envSensor.version.major, envSensor.version.minor,
-             envSensor.version.major_bugfix, envSensor.version.minor_bugfix);
+             envSensor.version.major,
+             envSensor.version.minor,
+             envSensor.version.major_bugfix,
+             envSensor.version.minor_bugfix); 
 
-    
-}
-
-// --- Main Application ---
-extern "C" void app_main(void) {
-    // Load environment variables
-    load_env_vars();
-
-    // Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    // Initialize Wi-Fi
-    wifi_init_sta();
-
-    // Initialize MQTT
-    mqtt_app_start();
-
-    setup_bsec2();
-
-    // main loop
-    while (true) {
+    // --- Main Loop ---
+    while(1) {
         if (!envSensor.run()) {
             checkBsecStatus(envSensor);
         }
+        // Small delay to allow other tasks to run
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    // buscfg.miso_io_num = PIN_NUM_MISO;
-    // buscfg.mosi_io_num = PIN_NUM_MOSI;
-    // buscfg.sclk_io_num = PIN_NUM_CLK;
-    // buscfg.max_transfer_sz = 4000;
+}
 
-    // // Step 2: Initialize the SPI bus
-    // ret = spi_bus_initialize(BME688_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    // ESP_ERROR_CHECK(ret);
+/**
+ * @brief Blinks the panic LED indefinitely in case of a fatal error.
+ */
+void errLeds(void)
+{
+    while(1)
+    {
+        gpio_set_level(PANIC_LED, 1);
+        vTaskDelay(pdMS_TO_TICKS(ERROR_DUR));
+        gpio_set_level(PANIC_LED, 0);
+        vTaskDelay(pdMS_TO_TICKS(ERROR_DUR));
+    }
+}
 
-    // // Step 3: Configure the device (BME688)
-    // spi_device_interface_config_t devcfg = {};
-    // devcfg.clock_speed_hz = 1000000;
-    // devcfg.mode = 0;
-    // devcfg.spics_io_num = -1;
-    // devcfg.queue_size = 7;
+/**
+ * @brief Callback function for when new sensor data is available.
+ */
+void newDataCallback(const bme68x_data data, const bsecOutputs outputs, Bsec2 bsec)
+{
+    if (!outputs.nOutputs) {
+        return;
+    }
 
-    // // Step 4: Add the device to the SPI bus
-    // ret = spi_bus_add_device(BME688_SPI_HOST, &devcfg, &spi_handle);
-    // ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "BSEC outputs:");
+    ESP_LOGI(TAG, "\tTime stamp = %lld", outputs.output[0].time_stamp / INT64_C(1000000));
 
-    // ESP_LOGI(TAG, "SPI bus initialized and device added.");
+    for (uint8_t i = 0; i < outputs.nOutputs; i++) {
+        const bsecData output = outputs.output[i];
+        switch (output.sensor_id) {
+            case BSEC_OUTPUT_IAQ:
+                ESP_LOGI(TAG, "\tIAQ = %.2f", output.signal);
+                ESP_LOGI(TAG, "\tIAQ accuracy = %d", (int)output.accuracy);
+                break;
+            case BSEC_OUTPUT_RAW_TEMPERATURE:
+                ESP_LOGI(TAG, "\tTemperature = %.2f C", output.signal);
+                break;
+            case BSEC_OUTPUT_RAW_PRESSURE:
+                ESP_LOGI(TAG, "\tPressure = %.2f hPa", output.signal);
+                break;
+            case BSEC_OUTPUT_RAW_HUMIDITY:
+                ESP_LOGI(TAG, "\tHumidity = %.2f %%", output.signal);
+                break;
+            case BSEC_OUTPUT_RAW_GAS:
+                ESP_LOGI(TAG, "\tGas resistance = %.0f Ohms", output.signal);
+                break;
+            case BSEC_OUTPUT_STABILIZATION_STATUS:
+                ESP_LOGI(TAG, "\tStabilization status = %d", (int)output.signal);
+                break;
+            case BSEC_OUTPUT_RUN_IN_STATUS:
+                ESP_LOGI(TAG, "\tRun in status = %d", (int)output.signal);
+                break;
+            case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE:
+                ESP_LOGI(TAG, "\tCompensated temperature = %.2f C", output.signal);
+                break;
+            case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY:
+                ESP_LOGI(TAG, "\tCompensated humidity = %.2f %%", output.signal);
+                break;
+            case BSEC_OUTPUT_STATIC_IAQ:
+                ESP_LOGI(TAG, "\tStatic IAQ = %.2f", output.signal);
+                break;
+            case BSEC_OUTPUT_CO2_EQUIVALENT:
+                ESP_LOGI(TAG, "\tCO2 Equivalent = %.2f ppm", output.signal);
+                break;
+            case BSEC_OUTPUT_BREATH_VOC_EQUIVALENT:
+                ESP_LOGI(TAG, "\tbVOC equivalent = %.2f ppm", output.signal);
+                break;
+            case BSEC_OUTPUT_GAS_PERCENTAGE:
+                ESP_LOGI(TAG, "\tGas percentage = %.2f", output.signal);
+                break;
+            case BSEC_OUTPUT_COMPENSATED_GAS:
+                 ESP_LOGI(TAG, "\tCompensated gas = %.0f Ohms", output.signal);
+                 break;
+            default:
+                break;
+        }
+    }
+}
 
-    // // Step 5: Configure the CS pin as a GPIO for manual control
-    // gpio_config_t io_conf;
-    // io_conf.intr_type = GPIO_INTR_DISABLE;
-    // io_conf.mode = GPIO_MODE_OUTPUT;
-    // io_conf.pin_bit_mask = (1ULL << PIN_NUM_CS);
-    // io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE; // Use enum value
-    // io_conf.pull_up_en = GPIO_PULLUP_DISABLE;     // Use enum value
-    // gpio_config(&io_conf);
+/**
+ * @brief Checks the BSEC and BME68x status codes and logs them. Halts on error.
+ */
+void checkBsecStatus(Bsec2 bsec)
+{
+    if (bsec.status < BSEC_OK) {
+        ESP_LOGE(TAG, "BSEC error code: %d", (int)bsec.status);
+        errLeds(); // Halt in case of failure
+    } else if (bsec.status > BSEC_OK) {
+        ESP_LOGW(TAG, "BSEC warning code: %d", (int)bsec.status);
+    }
 
-    // // Set CS pin high to de-select the device initially
-    // gpio_set_level(PIN_NUM_CS, 1);
-
-    // // Step 6: Initialize the BME68x sensor struct with our callback functions
-    // bme68x_sensor.read = user_spi_read;
-    // bme68x_sensor.write = user_spi_write;
-    // bme68x_sensor.delay_us = user_delay_us;
-    // bme68x_sensor.intf = BME68X_SPI_INTF; // Using SPI interface
-    // bme68x_sensor.intf_ptr = &spi_handle; // Pass the SPI handle to the callbacks
-
-    // // Step 7: Perform the sensor initialization and check for errors
-    // int8_t rslt = bme68x_init(&bme68x_sensor);
-    // if (rslt != BME68X_OK) {
-    //     ESP_LOGE(TAG, "BME688 initialization failed with error code: %d", rslt);
-    //     return;
-    // }
-
-    // ESP_LOGI(TAG, "BME688 initialized successfully.");
-
-    // // Step 8: Configure the sensor's oversampling and filter settings
-    // uint8_t op_mode = BME68X_FORCED_MODE;
-    // struct bme68x_conf conf;
-    // struct bme68x_heatr_conf heatr_conf;
-
-    // // Use default values
-    // bme68x_get_conf(&conf, &bme68x_sensor);
-    // conf.os_hum = BME68X_OS_2X;
-    // conf.os_pres = BME68X_OS_4X;
-    // conf.os_temp = BME68X_OS_8X;
-    // bme68x_set_conf(&conf, &bme68x_sensor);
-
-    // // Configure heater settings for gas measurement
-    // bme68x_get_heatr_conf(&heatr_conf, &bme68x_sensor);
-    // heatr_conf.enable = BME68X_ENABLE;
-    // heatr_conf.heatr_temp = 320; // 320 C
-    // heatr_conf.heatr_dur = 150;  // 150 ms
-    // bme68x_set_heatr_conf(op_mode, &heatr_conf, &bme68x_sensor);
-
-    // // Step 9: Main loop to continuously read and print data
-    // while (1) {
-    //     // We set the operating mode to BME68X_FORCED_MODE to trigger a single measurement
-    //     rslt = bme68x_set_op_mode(op_mode, &bme68x_sensor);
-    //     if (rslt != BME68X_OK) {
-    //         ESP_LOGE(TAG, "Failed to set op mode");
-    //     }
-
-    //     // Wait for the measurement to complete
-    //     uint32_t delay_period = bme68x_get_meas_dur(op_mode, &conf, &bme68x_sensor);
-    //     vTaskDelay(pdMS_TO_TICKS(delay_period / 1000 + 1));
-
-    //     // Read the sensor data
-    //     struct bme68x_data data;
-    //     uint8_t n_fields;
-    //     rslt = bme68x_get_data(op_mode, &data, &n_fields, &bme68x_sensor);
-    //     ESP_LOGI(TAG, "bme68x_get_data result: %d, n_fields: %d", rslt, n_fields);
-    //     if (rslt == BME68X_OK && n_fields > 0) {
-    //         char topic[64];
-    //         char payload[64];
-
-    //         if (data.status & BME68X_NEW_DATA_MSK) {
-    //             ESP_LOGI(TAG, "Temperature: %.2f °C", data.temperature);
-    //             ESP_LOGI(TAG, "Humidity: %.2f %%", data.humidity);
-    //             ESP_LOGI(TAG, "Pressure: %.2f hPa", data.pressure / 100.0);
-
-    //             snprintf(topic, sizeof(topic), "esp32/bme688/temperature");
-    //             snprintf(payload, sizeof(payload), "%.2f", data.temperature);
-    //             esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-
-    //             snprintf(topic, sizeof(topic), "esp32/bme688/humidity");
-    //             snprintf(payload, sizeof(payload), "%.2f", data.humidity);
-    //             esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-
-    //             snprintf(topic, sizeof(topic), "esp32/bme688/pressure");
-    //             snprintf(payload, sizeof(payload), "%.2f", data.pressure / 100.0);
-    //             esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-    //         }
-
-    //         if (data.status & BME68X_GASM_VALID_MSK) {
-    //             ESP_LOGI(TAG, "Gas resistance: %lu Ohms", (long unsigned int)data.gas_resistance);
-    //             snprintf(topic, sizeof(topic), "esp32/bme688/gas_resistance");
-    //             snprintf(payload, sizeof(payload), "%lu", (long unsigned int)data.gas_resistance);
-    //             esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-    //         }
-
-    //     } else {
-    //         ESP_LOGE(TAG, "Failed to read data from BME688. rslt=%d, n_fields=%d", rslt, n_fields);
-    //     }
-        
-    //     // Wait for 2 seconds before the next measurement
-    //     vTaskDelay(pdMS_TO_TICKS(2000));
-    // }
+    if (bsec.sensor.checkStatus() < BME68X_OK) {
+        ESP_LOGE(TAG, "BME68X error code: %d", (int)bsec.sensor.checkStatus());
+        errLeds(); // Halt in case of failure
+    } else if (bsec.sensor.checkStatus() > BME68X_OK) {
+        ESP_LOGW(TAG, "BME68X warning code: %d", (int)bsec.sensor.checkStatus());
+    }
 }

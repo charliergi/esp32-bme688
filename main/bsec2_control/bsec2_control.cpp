@@ -5,6 +5,7 @@ extern "C" {
 #include "driver/spi_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "rom/ets_sys.h" // For ets_delay_us
 }
 
 #include "bsec2.h"
@@ -17,86 +18,78 @@ extern "C" {
 // void errLeds();
 
 // Platform-specific functions for BSEC2 library
-int8_t bme68x_spi_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr) {
-    spi_device_handle_t spi_dev = (spi_device_handle_t)intf_ptr;
+int8_t bme_spi_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr) {
+    spi_device_handle_t handle = *(spi_device_handle_t *)intf_ptr;
+    esp_err_t ret;
+
+    ESP_LOGD(TAG, "SPI Write: reg=0x%02X, len=%lu", reg_addr, len);
+
     spi_transaction_t t;
-
-    // Validate input parameters
-    if (!reg_data || len == 0) {
-        ESP_LOGW(BSEC_TAG, "Invalid input: reg_data is NULL or len is zero");
-        return BME68X_E_COM_FAIL;
-    }
-
     memset(&t, 0, sizeof(t));
-    t.flags = SPI_TRANS_USE_TXDATA;
+// ...existing code...
+    t.length = 8; // 8 bits for the register address
 
-    // Send register address with read bit
-    t.tx_data[0] = reg_addr | 0x80;
-    t.length = 8;
-
-    if (spi_device_polling_transmit(spi_dev, &t) != ESP_OK) {
-        ESP_LOGW(BSEC_TAG, "Failed to send read command");
-        return BME68X_E_COM_FAIL;
+    // Transmit the register address
+    ret = spi_device_polling_transmit(handle, &t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI Write reg_addr failed: %s", esp_err_to_name(ret));
+        return -1;
     }
 
-    // Prepare receive transaction
-    memset(&t, 0, sizeof(t));
-    t.rxlength = len * 8;
-    t.rx_buffer = reg_data;
-    t.flags = SPI_TRANS_USE_TXDATA;
-
-    if (spi_device_polling_transmit(spi_dev, &t) != ESP_OK) {
-        ESP_LOGW(BSEC_TAG, "Failed to receive data");
-        return BME68X_E_COM_FAIL;
+    // Transmit the data
+    if (len > 0) {
+        memset(&t, 0, sizeof(t));
+        t.tx_buffer = reg_data;
+        t.length = len * 8; // length is in bits
+        ret = spi_device_polling_transmit(handle, &t);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "SPI Write data failed: %s", esp_err_to_name(ret));
+            return -1;
+        }
     }
-
-    return BME68X_OK;
+    
+    return 0;
 }
 
-int8_t bme68x_spi_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr) {
-    spi_device_handle_t spi_dev = (spi_device_handle_t)intf_ptr;
+/**
+ * @brief SPI read function for ESP-IDF
+ */
+int8_t bme_spi_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr) {
+    spi_device_handle_t handle = *(spi_device_handle_t *)intf_ptr;
+    esp_err_t ret;
+
+    if (len == 0) {
+        return 0;
+    }
+
     spi_transaction_t t;
-
-    if (!reg_data || len == 0) {
-        ESP_LOGW(BSEC_TAG, "Invalid input: reg_data is NULL or len is zero");
-        return BME68X_E_COM_FAIL;
-    }
-
     memset(&t, 0, sizeof(t));
-    t.flags = SPI_TRANS_USE_TXDATA;
+    t.length = len * 8; // Total bits to receive
+    t.rxlength = len * 8;
+    t.tx_buffer = NULL;
+    t.rx_buffer = reg_data;
+    t.cmd = reg_addr | 0x80; // Command phase: register address with read bit
 
-    uint8_t* tx_buf = (uint8_t*)malloc(len + 1);
-    if (!tx_buf) {
-        ESP_LOGW(BSEC_TAG, "Memory allocation failed for SPI write");
-        return BME68X_E_NULL_PTR;
+    ret = spi_device_polling_transmit(handle, &t);
+
+    if (ret == ESP_OK) {
+        ESP_LOGD(TAG, "SPI Read: reg=0x%02X, len=%lu", reg_addr, len);
+        if (len > 0) {
+            char data_str[len * 3 + 1];
+            for (int i = 0; i < len; i++) {
+                sprintf(data_str + i * 3, "%02X ", reg_data[i]);
+            }
+            ESP_LOGD(TAG, "  Data: %s", data_str);
+        }
+        return 0;
+    } else {
+        ESP_LOGE(TAG, "SPI Read failed: %s", esp_err_to_name(ret));
+        return -1;
     }
-
-    tx_buf[0] = reg_addr & 0x7F;
-    memcpy(tx_buf + 1, reg_data, len);
-
-    t.tx_buffer = tx_buf;
-    t.length = (len + 1) * 8;
-
-    esp_err_t ret = spi_device_polling_transmit(spi_dev, &t);
-    free(tx_buf);
-
-    if (ret != ESP_OK) {
-        ESP_LOGW(BSEC_TAG, "SPI write failed");
-        return BME68X_E_COM_FAIL;
-    }
-
-    return BME68X_OK;
 }
 
 void bme68x_delay_us(uint32_t period, void *intf_ptr) {
-    if (period >= 1000) {
-        vTaskDelay(pdMS_TO_TICKS(period / 1000));
-    } else {
-        // For delays < 1ms, a busy wait is okay for short periods
-        // ets_delay_us is not recommended for FreeRTOS, but for very short delays it's often used.
-        // Or just delay for 1 tick if precision is not critical.
-        vTaskDelay(1);
-    }
+    ets_delay_us(period);
 }
 
 unsigned long get_millis() {
@@ -173,41 +166,41 @@ unsigned long get_millis() {
 //         vTaskDelay(pdMS_TO_TICKS(10));
 //     }
 // }
-void newDataCallback(const bme68x_data data, const bsecOutputs outputs, Bsec2 bsec)
-{
-    if (!outputs.nOutputs) return;
+// void newDataCallback(const bme68x_data data, const bsecOutputs outputs, Bsec2 bsec)
+// {
+//     if (!outputs.nOutputs) return;
 
-    ESP_LOGI(TAG, "Timestamp %lld ms", outputs.output[0].time_stamp / 1000000);
+//     ESP_LOGI(TAG, "Timestamp %lld ms", outputs.output[0].time_stamp / 1000000);
 
-    for (uint8_t i = 0; i < outputs.nOutputs; i++) {
-        const bsecData output = outputs.output[i];
-        switch (output.sensor_id) {
-            case BSEC_OUTPUT_IAQ:
-                ESP_LOGI(TAG, "IAQ %.2f (acc %d)", output.signal, output.accuracy);
-                break;
-            case BSEC_OUTPUT_RAW_TEMPERATURE:
-                ESP_LOGI(TAG, "Temperature %.2f °C", output.signal);
-                break;
-            case BSEC_OUTPUT_RAW_PRESSURE:
-                ESP_LOGI(TAG, "Pressure %.2f hPa", output.signal);
-                break;
-            case BSEC_OUTPUT_RAW_HUMIDITY:
-                ESP_LOGI(TAG, "Humidity %.2f %%", output.signal);
-                break;
-            case BSEC_OUTPUT_RAW_GAS:
-                ESP_LOGI(TAG, "Gas resistance %.2f", output.signal);
-                break;
-            case BSEC_OUTPUT_CO2_EQUIVALENT:
-                ESP_LOGI(TAG, "CO2eq %.2f ppm", output.signal);
-                break;
-            case BSEC_OUTPUT_BREATH_VOC_EQUIVALENT:
-                ESP_LOGI(TAG, "bVOCeq %.2f ppm", output.signal);
-                break;
-            default:
-                break;
-        }
-    }
-}
+//     for (uint8_t i = 0; i < outputs.nOutputs; i++) {
+//         const bsecData output = outputs.output[i];
+//         switch (output.sensor_id) {
+//             case BSEC_OUTPUT_IAQ:
+//                 ESP_LOGI(TAG, "IAQ %.2f (acc %d)", output.signal, output.accuracy);
+//                 break;
+//             case BSEC_OUTPUT_RAW_TEMPERATURE:
+//                 ESP_LOGI(TAG, "Temperature %.2f °C", output.signal);
+//                 break;
+//             case BSEC_OUTPUT_RAW_PRESSURE:
+//                 ESP_LOGI(TAG, "Pressure %.2f hPa", output.signal);
+//                 break;
+//             case BSEC_OUTPUT_RAW_HUMIDITY:
+//                 ESP_LOGI(TAG, "Humidity %.2f %%", output.signal);
+//                 break;
+//             case BSEC_OUTPUT_RAW_GAS:
+//                 ESP_LOGI(TAG, "Gas resistance %.2f", output.signal);
+//                 break;
+//             case BSEC_OUTPUT_CO2_EQUIVALENT:
+//                 ESP_LOGI(TAG, "CO2eq %.2f ppm", output.signal);
+//                 break;
+//             case BSEC_OUTPUT_BREATH_VOC_EQUIVALENT:
+//                 ESP_LOGI(TAG, "bVOCeq %.2f ppm", output.signal);
+//                 break;
+//             default:
+//                 break;
+//         }
+//     }
+// }
 
 void checkBsecStatus(Bsec2 bsec)
 {
